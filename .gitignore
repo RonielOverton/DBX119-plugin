@@ -10,3 +10,10 @@ Thumbs.db
 # Never commit SDKs that are not ours (e.g. a private VST2 SDK)
 sdks/
 .env
+
+# Calibration kit outputs (recordings stay out of the repo)
+tools/calibration/build/
+signals/
+recorded/
+rendered/
+results/
