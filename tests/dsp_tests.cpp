@@ -311,9 +311,10 @@ void testStereoLink()
         const double measuredGainDb = rmsDb (left, kHalfSecond, n) - rmsDb (inLeft, kHalfSecond, n);
         CHECK_NEAR (measuredGainDb, core.getGainDb (), 0.5);
 
-        // Sanity: the detector sums both channels (0.5 * (l^2 + r^2)), so the level is
-        // -6 - 3.01 = -9.01 dBFS, 10.99 dB over threshold, gain -0.5 * 10.99 = -5.495 dB.
-        CHECK_NEAR (measuredGainDb, -5.495, 0.1);
+        // Sanity: the detector measures the sum of the signals, s = 0.5 (L + R). A signal
+        // on one channel only reads 6.02 dB lower: -6 - 6.02 = -12.02 dBFS, 7.98 dB over
+        // threshold, gain -0.5 * 7.98 = -3.99 dB. (Was -5.495 with the old power average.)
+        CHECK_NEAR (measuredGainDb, -3.99, 0.1);
     }
 
     // Link off, same input: right channel is still silent (silence times any gain).
@@ -333,6 +334,124 @@ void testStereoLink()
 
         CHECK_NEAR (maxAbs (right), 0.0, 0.0);
     }
+}
+
+// Linked, left sine at -6 dBFS RMS, right silent: the detector sees s = 0.5 L,
+// which is 6.02 dB lower, so the level is -12.02 dBFS.
+void testStereoLinkOneChannelLevel()
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs);
+    rto119::Parameters p;
+    p.amount = -0.5f;
+    p.thresholdDb = -20.0f;
+    p.mode = rto119::Mode::Linear;
+    p.stereoLink = true;
+    core.setParameters (p);
+
+    std::vector<float> left = makeSine (kSecond, ampFromRmsDb (-6.0));
+    std::vector<float> right (kSecond, 0.0f);
+    runStereo (core, left, right);
+
+    CHECK_NEAR (core.getLevelDb (), -12.02, 0.3);
+}
+
+// Linked, L = -R: the sum is zero, so the detector sees nothing and stays at the floor.
+void testStereoLinkAntiPhase()
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs);
+    rto119::Parameters p;
+    p.amount = -0.5f;
+    p.thresholdDb = -20.0f;
+    p.mode = rto119::Mode::Linear;
+    p.stereoLink = true;
+    core.setParameters (p);
+
+    std::vector<float> left = makeSine (kSecond, ampFromRmsDb (-6.0));
+    std::vector<float> right = left;
+    for (float& v : right)
+        v = -v;
+    runStereo (core, left, right);
+
+    CHECK_NEAR (core.getLevelDb (), -80.0, 0.1);
+    CHECK_NEAR (core.getGainDb (),
+                rto119::computeGainDb (-80.0f, -20.0f, 0.5f, rto119::Mode::Linear, 24.0f, 60.0f),
+                0.1);
+}
+
+// Mean of the detected level over the last 0.5 s of a 2 s run of a mono-identical
+// sine (L = R), read after each 256-sample block.
+double meanDetectedLevelDb (double freqHz, double sineRmsDb, const rto119::CompanderCore::Tuning& t)
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs, t);
+    rto119::Parameters p;
+    p.amount = -0.5f;
+    p.thresholdDb = -40.0f;
+    p.mode = rto119::Mode::Linear;
+    p.stereoLink = true;
+    core.setParameters (p);
+
+    const std::size_t n = 2 * kSecond;
+    std::vector<float> left = makeSine (n, ampFromRmsDb (sineRmsDb), freqHz);
+    std::vector<float> right = left;
+    double acc = 0.0;
+    int count = 0;
+    for (std::size_t start = 0; start < n; start += 256)
+    {
+        const int len = static_cast<int> (std::min<std::size_t> (256, n - start));
+        float* chans[2] = { left.data () + start, right.data () + start };
+        core.process (chans, 2, len);
+        if (start >= n - kHalfSecond)
+        {
+            acc += core.getLevelDb ();
+            ++count;
+        }
+    }
+    return acc / count;
+}
+
+// Detector high-pass at 31.2 Hz: |H(20 Hz)| = 0.540 = -5.36 dB, |H(1 kHz)| about -0.004 dB.
+void testDetectorHighPass()
+{
+    rto119::CompanderCore::Tuning withHp;           // default 31.2 Hz
+    const double mid = meanDetectedLevelDb (1000.0, -10.0, withHp);
+    const double low = meanDetectedLevelDb (20.0, -10.0, withHp);
+    CHECK_NEAR (mid, -10.0, 0.1);
+    CHECK_NEAR (mid - low, 5.4, 1.0);
+
+    // With the high-pass off (0 Hz), 20 Hz reads about the same as 1 kHz.
+    rto119::CompanderCore::Tuning noHp;
+    noHp.detectorHighPassHz = 0.0f;
+    const double midOff = meanDetectedLevelDb (1000.0, -10.0, noHp);
+    const double lowOff = meanDetectedLevelDb (20.0, -10.0, noHp);
+    CHECK_NEAR (midOff - lowOff, 0.0, 1.0);
+}
+
+// The threshold LED is lit only in ABOVE THRESHOLD mode.
+bool ledAfterLoudSine (rto119::Mode mode)
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs);
+    rto119::Parameters p;
+    p.amount = -0.5f;
+    p.thresholdDb = -20.0f;
+    p.mode = mode;
+    p.stereoLink = true;
+    core.setParameters (p);
+
+    std::vector<float> left = makeSine (kSecond, ampFromRmsDb (-6.0));
+    std::vector<float> right = left;
+    runStereo (core, left, right);
+    return core.isAboveThreshold ();
+}
+
+void testThresholdLedMode()
+{
+    // Signal is 14 dB above threshold in both runs.
+    CHECK (!ledAfterLoudSine (rto119::Mode::Linear));
+    CHECK (ledAfterLoudSine (rto119::Mode::AboveThreshold));
 }
 
 void testOutputGain()
@@ -368,6 +487,10 @@ int main()
     testAboveThresholdLimitsLoudSignal ();
     testReleaseRate ();
     testStereoLink ();
+    testStereoLinkOneChannelLevel ();
+    testStereoLinkAntiPhase ();
+    testDetectorHighPass ();
+    testThresholdLedMode ();
     testOutputGain ();
 
     if (g_failures == 0)

@@ -273,10 +273,12 @@ def run_stereo(x_in, x_out, fs, entry, rep, base, static_csv):
                 f"({'silent' if sil_out < -90 else 'NOT silent: crosstalk or boosted noise'})")
         if static is not None:
             g_ind = float(np.interp(i_db, static[0], static[1]))
-            g_link = float(np.interp(i_db + 10.0 * np.log10(0.5), static[0], static[1]))
+            # Linked detector sums the inputs (s = 0.5 (L + R)): a signal on one channel
+            # only reads 20 log10(0.5) = -6.02 dB below its own level.
+            g_link = float(np.interp(i_db + 20.0 * np.log10(0.5), static[0], static[1]))
             d_ind, d_link = abs(gain - g_ind), abs(gain - g_link)
             rep.add(f"[{name}] static-curve gain at this level, independent detection: {g_ind:.2f} dB")
-            rep.add(f"[{name}] static-curve gain at this level, linked (power average over both channels): {g_link:.2f} dB")
+            rep.add(f"[{name}] static-curve gain at this level, linked (sum of both inputs, as in the hardware): {g_link:.2f} dB")
             if min(d_ind, d_link) < 0.5 and d_link < d_ind:
                 verdict = "consistent with linked detection"
             elif min(d_ind, d_link) < 0.5 and d_ind < d_link:
