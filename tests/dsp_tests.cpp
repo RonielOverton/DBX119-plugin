@@ -1,10 +1,11 @@
 // dsp_tests.cpp
-// Unit tests for src/dsp/CompanderCore.h. No test framework.
+// Unit tests for src/dsp/CompanderCore.h and src/dsp/IronStage.h. No test framework.
 //
 // Build and run:
 //   g++ -std=c++17 -O2 -Wall -Wextra -Isrc tests/dsp_tests.cpp -o /tmp/dsp_tests && /tmp/dsp_tests
 
 #include "dsp/CompanderCore.h"
+#include "dsp/IronStage.h"
 
 #include <algorithm>
 #include <cmath>
@@ -604,6 +605,174 @@ void testDetectorIgnoresInputHighPass()
                 linkedLevelAfterSine (20.0, -10.0, noIn), 0.01);
 }
 
+
+// ---------------------------------------------------------------------------
+// IronStage (D1P-21). Run at 192 kHz, the rate the plugin uses (4x a 48 kHz host).
+// The stage is an addition, not part of the original 119; its limits are ASSUMPTIONS
+// tuned by ear. Each run is 1.5 s; the first 0.5 s is discarded (settling). Measurements
+// use the last 1 s, which holds whole cycles of 50 Hz and 1 kHz and of their harmonics.
+
+constexpr double kIronFs = 192000.0;
+constexpr std::size_t kIronRun = 288000;        // 1.5 s
+constexpr std::size_t kIronFrom = 96000;        // 0.5 s
+constexpr std::size_t kIronSecond = 192000;     // 1 s
+
+std::vector<float> makeSineAt (std::size_t n, float amp, double freqHz, double fs)
+{
+    std::vector<float> v (n);
+    for (std::size_t i = 0; i < n; ++i)
+        v[i] = static_cast<float> (amp * std::sin (2.0 * kPi * freqHz * static_cast<double> (i) / fs));
+    return v;
+}
+
+// Runs one channel through a fresh IronStage at kIronFs.
+std::vector<float> ironRun (const std::vector<float>& in)
+{
+    rto119::IronStage stage;
+    stage.prepare (kIronFs);
+    std::vector<float> out (in.size());
+    for (std::size_t i = 0; i < in.size(); ++i)
+        out[i] = stage.processSample (0, in[i]);
+    return out;
+}
+
+// Power of harmonic k (1 = fundamental) of freqHz over v[start, end), by a DFT at the
+// exact harmonic frequency. The window holds whole cycles of each harmonic, so no leakage.
+double harmonicPower (const std::vector<float>& v, std::size_t start, std::size_t end,
+                      double freqHz, int k)
+{
+    const double w = 2.0 * kPi * static_cast<double> (k) * freqHz / kIronFs;
+    double re = 0.0;
+    double im = 0.0;
+    for (std::size_t n = start; n < end; ++n)
+    {
+        const double x = static_cast<double> (v[n]);
+        re += x * std::cos (w * static_cast<double> (n));
+        im += x * std::sin (w * static_cast<double> (n));
+    }
+    const double amp = 2.0 * std::sqrt (re * re + im * im) / static_cast<double> (end - start);
+    return 0.5 * amp * amp;
+}
+
+// THD in dB: power of harmonics 2 to 5 over the fundamental power.
+double ironThdDb (const std::vector<float>& v, double freqHz)
+{
+    double harm = 0.0;
+    for (int k = 2; k <= 5; ++k)
+        harm += harmonicPower (v, kIronFrom, kIronRun, freqHz, k);
+    const double fund = harmonicPower (v, kIronFrom, kIronRun, freqHz, 1);
+    return 10.0 * std::log10 (std::max (harm / fund, 1.0e-30));
+}
+
+void testIronSmallSignal()
+{
+    const std::vector<float> in = makeSineAt (kIronRun, ampFromRmsDb (-40.0), 1000.0, kIronFs);
+    const std::vector<float> out = ironRun (in);
+
+    const double inDb = rmsDb (in, kIronFrom, kIronRun);
+    const double outDb = rmsDb (out, kIronFrom, kIronRun);
+    const double thd = ironThdDb (out, 1000.0);
+    std::printf ("info: iron small signal 1 kHz -40 dBFS: in %.4f dBFS, out %.4f dBFS, THD %.2f dB\n",
+                 inDb, outDb, thd);
+
+    CHECK_NEAR (outDb, inDb, 0.1);
+    CHECK (thd < -80.0);
+}
+
+void testIronUnityAt1kHz()
+{
+    const std::vector<float> in = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 1000.0, kIronFs);
+    const std::vector<float> out = ironRun (in);
+
+    const double gainDb = rmsDb (out, kIronFrom, kIronRun) - rmsDb (in, kIronFrom, kIronRun);
+    std::printf ("info: iron gain at 1 kHz -6 dBFS: %.4f dB\n", gainDb);
+    CHECK_NEAR (gainDb, 0.0, 0.5);
+}
+
+void testIronFrequencyDependence()
+{
+    const std::vector<float> in50 = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 50.0, kIronFs);
+    const std::vector<float> in1k = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 1000.0, kIronFs);
+    const double thd50 = ironThdDb (ironRun (in50), 50.0);
+    const double thd1k = ironThdDb (ironRun (in1k), 1000.0);
+    std::printf ("info: iron THD at -6 dBFS: 50 Hz %.2f dB, 1 kHz %.2f dB\n", thd50, thd1k);
+
+    CHECK (thd50 >= thd1k + 20.0);
+    CHECK (thd50 >= -50.0 && thd50 <= -15.0);
+}
+
+void testIronLevelDependence()
+{
+    const std::vector<float> loud = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 50.0, kIronFs);
+    const std::vector<float> quiet = makeSineAt (kIronRun, ampFromRmsDb (-30.0), 50.0, kIronFs);
+    const double thdLoud = ironThdDb (ironRun (loud), 50.0);
+    const double thdQuiet = ironThdDb (ironRun (quiet), 50.0);
+    std::printf ("info: iron THD at 50 Hz: -6 dBFS %.2f dB, -30 dBFS %.2f dB\n", thdLoud, thdQuiet);
+
+    CHECK (thdLoud >= thdQuiet + 20.0);
+}
+
+void testIronThirdHarmonicDominates()
+{
+    const std::vector<float> in = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 50.0, kIronFs);
+    const std::vector<float> out = ironRun (in);
+    const double h2 = harmonicPower (out, kIronFrom, kIronRun, 50.0, 2);
+    const double h3 = harmonicPower (out, kIronFrom, kIronRun, 50.0, 3);
+    const double ratioDb = 10.0 * std::log10 (std::max (h3, 1.0e-30) / std::max (h2, 1.0e-30));
+    std::printf ("info: iron 50 Hz -6 dBFS: 3rd over 2nd by %.2f dB\n", ratioDb);
+
+    CHECK (ratioDb >= 20.0);
+}
+
+void testIronNoDc()
+{
+    const std::vector<float> in = makeSineAt (kIronRun, ampFromRmsDb (-6.0), 50.0, kIronFs);
+    const std::vector<float> out = ironRun (in);
+    const double mean = meanOf (out, kIronRun - kIronSecond, kIronRun);
+    std::printf ("info: iron DC offset over last second: %.3e\n", mean);
+
+    CHECK (std::fabs (mean) < 1.0e-4);
+}
+
+void testIronReset()
+{
+    rto119::IronStage stage;
+    stage.prepare (kIronFs);
+    const std::vector<float> loud = makeSineAt (kIronFrom, 1.0f, 1000.0, kIronFs);
+    for (float x : loud)
+    {
+        stage.processSample (0, x);
+        stage.processSample (1, x);
+    }
+
+    // The state is still ringing before reset (checked on a copy).
+    rto119::IronStage probe = stage;
+    CHECK (probe.processSample (0, 0.0f) != 0.0f);
+
+    stage.reset();
+    for (int i = 0; i < 1000; ++i)
+    {
+        CHECK (stage.processSample (0, 0.0f) == 0.0f);
+        CHECK (stage.processSample (1, 0.0f) == 0.0f);
+    }
+}
+
+// Channel 1 stays silent while channel 0 is driven: the two channels keep separate state.
+void testIronChannelsIndependent()
+{
+    rto119::IronStage stage;
+    stage.prepare (kIronFs);
+    const std::vector<float> loud = makeSineAt (kIronFrom, 1.0f, 50.0, kIronFs);
+    bool silentOutput = true;
+    for (float x : loud)
+    {
+        stage.processSample (0, x);
+        if (stage.processSample (1, 0.0f) != 0.0f)
+            silentOutput = false;
+    }
+    CHECK (silentOutput);
+}
+
 } // namespace
 
 int main()
@@ -626,6 +795,14 @@ int main()
     testAudioHighPassResponse ();
     testAudioHighPassRemovesDc ();
     testDetectorIgnoresInputHighPass ();
+    testIronSmallSignal ();
+    testIronUnityAt1kHz ();
+    testIronFrequencyDependence ();
+    testIronLevelDependence ();
+    testIronThirdHarmonicDominates ();
+    testIronNoDc ();
+    testIronReset ();
+    testIronChannelsIndependent ();
 
     if (g_failures == 0)
     {

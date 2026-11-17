@@ -31,6 +31,7 @@ RTO119Processor::RTO119Processor()
     outputParam    = apvts.getRawParameterValue (ParamIDs::output);
     linkParam      = apvts.getRawParameterValue (ParamIDs::link);
     bypassParam    = apvts.getRawParameterValue (ParamIDs::bypass);
+    ironParam      = apvts.getRawParameterValue (ParamIDs::iron);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout RTO119Processor::createLayout()
@@ -63,12 +64,32 @@ juce::AudioProcessorValueTreeState::ParameterLayout RTO119Processor::createLayou
     layout.add (std::make_unique<AudioParameterBool> (
         ParameterID { ParamIDs::bypass, 1 }, "Bypass", false));
 
+    // D1P-21. The dbx 119 has no output transformer; this is an addition, off by default.
+    layout.add (std::make_unique<AudioParameterBool> (
+        ParameterID { ParamIDs::iron, 1 }, "Iron (transformer color)", false));
+
     return layout;
 }
 
-void RTO119Processor::prepareToPlay (double sampleRate, int)
+void RTO119Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     core.prepare (sampleRate);
+
+    // Iron stage (D1P-21). All buffers are allocated here, never in processBlock.
+    // The oversampler is built with factor 2, so it runs at 4x the host rate.
+    // The oversampler's IIR latency is NOT reported to the host (getLatencyInSamples()
+    // stays 0, as D1P-21 requires). Measured with this configuration: 3.42 samples at the
+    // host rate. The Iron path is a parallel crossfade, not a latency-compensated insert.
+    const int maxBlock = juce::jmax (1, samplesPerBlock);
+    ironMaxBlock = maxBlock;
+    oversampler.initProcessing (static_cast<size_t> (maxBlock));
+    oversampler.reset();
+    iron.prepare (sampleRate * 4.0);
+    dryBuffer.setSize (2, maxBlock, false, false, true);
+
+    // 20 ms linear crossfade between the dry and Iron paths. Starts at the saved state.
+    ironMix.reset (sampleRate, 0.02);
+    ironMix.setCurrentAndTargetValue (ironParam->load() > 0.5f ? 1.0f : 0.0f);
 }
 
 bool RTO119Processor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -105,9 +126,79 @@ void RTO119Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
                   juce::jmin (2, getTotalNumOutputChannels()),
                   buffer.getNumSamples());
 
+    processIron (buffer);
+
     meterGainDb = core.getGainDb();
     meterLevelDb = core.getLevelDb();
     meterAboveThreshold = core.isAboveThreshold();
+}
+
+// Iron stage (D1P-21). NOT PART OF THE ORIGINAL 119. Real-time safe: no allocation,
+// no locks, no I/O. Runs only while the mix is moving or on; when off and fully faded
+// out, the buffer is left bit-identical.
+void RTO119Processor::processIron (juce::AudioBuffer<float>& buffer)
+{
+    ironMix.setTargetValue (ironParam->load() > 0.5f ? 1.0f : 0.0f);
+
+    if (! ironMix.isSmoothing() && ironMix.getCurrentValue() <= 0.0f)
+        return;
+
+    if (ironMaxBlock <= 0)
+        return;
+
+    // A host may send a block larger than prepared. Process it in chunks of the
+    // prepared size: the oversampler is stateful, so chunks join without a gap.
+    const int total = buffer.getNumSamples();
+    for (int start = 0; start < total; start += ironMaxBlock)
+        processIronChunk (buffer, start, juce::jmin (ironMaxBlock, total - start));
+}
+
+void RTO119Processor::processIronChunk (juce::AudioBuffer<float>& buffer, int start, int len)
+{
+    const int numCh = juce::jmin (2, buffer.getNumChannels());
+
+    // Dry copy for the crossfade.
+    for (int ch = 0; ch < numCh; ++ch)
+        dryBuffer.copyFrom (ch, 0, buffer, ch, start, len);
+
+    // Up: 4x. Input pointers live on the stack.
+    const float* inPtrs[2] = { nullptr, nullptr };
+    float* outPtrs[2] = { nullptr, nullptr };
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        inPtrs[ch]  = buffer.getReadPointer (ch, start);
+        outPtrs[ch] = buffer.getWritePointer (ch, start);
+    }
+
+    juce::dsp::AudioBlock<const float> inBlock (inPtrs, static_cast<size_t> (numCh), static_cast<size_t> (len));
+    juce::dsp::AudioBlock<float> up = oversampler.processSamplesUp (inBlock);
+
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        float* x = up.getChannelPointer (static_cast<size_t> (ch));
+        for (size_t i = 0; i < up.getNumSamples(); ++i)
+            x[i] = iron.processSample (ch, x[i]);
+    }
+
+    // Down: back to the host rate, into the main buffer.
+    juce::dsp::AudioBlock<float> outBlock (outPtrs, static_cast<size_t> (numCh), static_cast<size_t> (len));
+    oversampler.processSamplesDown (outBlock);
+
+    // Crossfade per sample: out = dry + (wet - dry) * mix.
+    float* wet[2] = { nullptr, nullptr };
+    const float* dry[2] = { nullptr, nullptr };
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        wet[ch] = outPtrs[ch];
+        dry[ch] = dryBuffer.getReadPointer (ch, 0);
+    }
+
+    for (int i = 0; i < len; ++i)
+    {
+        const float mix = ironMix.getNextValue();
+        for (int ch = 0; ch < numCh; ++ch)
+            wet[ch][i] = dry[ch][i] + (wet[ch][i] - dry[ch][i]) * mix;
+    }
 }
 
 juce::AudioProcessorParameter* RTO119Processor::getBypassParameter() const

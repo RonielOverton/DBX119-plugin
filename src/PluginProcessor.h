@@ -2,6 +2,7 @@
 
 #include <JuceHeader.h>
 #include "dsp/CompanderCore.h"
+#include "dsp/IronStage.h"
 
 #include <atomic>
 
@@ -13,6 +14,7 @@ namespace ParamIDs
     inline constexpr const char* output    = "output";     // dB
     inline constexpr const char* link      = "link";       // stereo-linked detection
     inline constexpr const char* bypass    = "bypass";
+    inline constexpr const char* iron      = "iron";       // Iron (transformer color), off by default (D1P-21)
 }
 
 class RTO119Processor final : public juce::AudioProcessor
@@ -57,7 +59,19 @@ public:
     std::atomic<bool>  meterAboveThreshold { false };
 
 private:
+    void processIron (juce::AudioBuffer<float>& buffer);
+    void processIronChunk (juce::AudioBuffer<float>& buffer, int start, int len);
+
     rto119::CompanderCore core;
+
+    // Iron stage (D1P-21). NOT PART OF THE ORIGINAL 119; see src/dsp/IronStage.h.
+    // 2 channels, factor 2 = 4x. The IIR latency is not reported (see PluginProcessor.cpp).
+    juce::dsp::Oversampling<float> oversampler { 2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, false };
+    rto119::IronStage iron;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ironMix;
+    juce::AudioBuffer<float> dryBuffer;   // preallocated in prepareToPlay, 2 x samplesPerBlock
+    int ironMaxBlock = 0;                 // largest block the stage is prepared for
+    std::atomic<float>* ironParam = nullptr;
 
     std::atomic<float>* amountParam = nullptr;
     std::atomic<float>* thresholdParam = nullptr;
