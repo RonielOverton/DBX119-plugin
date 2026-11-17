@@ -18,11 +18,15 @@ private:
 
     RTO119Processor& processor;
 
+    // Needed for component tooltips to show.
+    juce::TooltipWindow tooltipWindow { this, 600 };
+
     // Components are declared before the attachments that reference them.
     juce::Label amountLabel, thresholdLabel, outputLabel, modeLabel;
     juce::Slider amountSlider, thresholdSlider, outputSlider;
     juce::ComboBox modeBox;
-    juce::ToggleButton linkButton, bypassButton;
+    juce::ToggleButton linkButton, bypassButton, ironButton;
+    juce::Label ironNoteLabel;
 
     // Areas that the 30 Hz timer repaints.
     juce::Rectangle<int> ledBounds, meterBounds;
@@ -34,6 +38,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>   linkAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>   bypassAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>   ironAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RTO119Editor)
 };

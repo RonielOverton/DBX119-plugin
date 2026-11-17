@@ -58,14 +58,24 @@ RTO119Editor::RTO119Editor (RTO119Processor& p)
 
     linkButton.setButtonText ("Stereo Link");
     bypassButton.setButtonText ("Bypass");
+    ironButton.setButtonText ("Iron");
     linkButton.setColour (juce::ToggleButton::textColourId, creamText);
     bypassButton.setColour (juce::ToggleButton::textColourId, creamText);
+    ironButton.setColour (juce::ToggleButton::textColourId, creamText);
+    ironButton.setTooltip ("Optional output-transformer color. Not part of the original unit. Off by default.");
+
+    ironNoteLabel.setText ("transformer color, not on original", juce::dontSendNotification);
+    ironNoteLabel.setJustificationType (juce::Justification::centred);
+    ironNoteLabel.setFont (juce::Font (juce::FontOptions (10.0f)));
+    ironNoteLabel.setColour (juce::Label::textColourId, creamText.withAlpha (0.6f));
+    ironNoteLabel.setMinimumHorizontalScale (0.6f);   // keeps the text inside the 120 px column
 
     for (auto* c : { static_cast<juce::Component*> (&amountLabel), static_cast<juce::Component*> (&thresholdLabel),
                      static_cast<juce::Component*> (&outputLabel), static_cast<juce::Component*> (&modeLabel),
                      static_cast<juce::Component*> (&amountSlider), static_cast<juce::Component*> (&thresholdSlider),
                      static_cast<juce::Component*> (&outputSlider), static_cast<juce::Component*> (&modeBox),
-                     static_cast<juce::Component*> (&linkButton), static_cast<juce::Component*> (&bypassButton) })
+                     static_cast<juce::Component*> (&linkButton), static_cast<juce::Component*> (&bypassButton),
+                     static_cast<juce::Component*> (&ironButton), static_cast<juce::Component*> (&ironNoteLabel) })
         addAndMakeVisible (c);
 
     // Attachments are created after the components they bind to.
@@ -81,6 +91,8 @@ RTO119Editor::RTO119Editor (RTO119Processor& p)
         processor.apvts, ParamIDs::link, linkButton);
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.apvts, ParamIDs::bypass, bypassButton);
+    ironAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.apvts, ParamIDs::iron, ironButton);
 
     startTimerHz (30);
 }
@@ -106,6 +118,8 @@ void RTO119Editor::resized()
     modeBox.setBounds (452, 92, 120, 24);
     linkButton.setBounds (452, 132, 120, 24);
     bypassButton.setBounds (452, 164, 120, 24);
+    ironButton.setBounds (452, 196, 120, 24);
+    ironNoteLabel.setBounds (452, 220, 120, 14);
 
     meterBounds = juce::Rectangle<int> (60, 238, 500, 46);
 }
