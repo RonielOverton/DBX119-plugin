@@ -29,7 +29,7 @@ GitHub Actions (`.github/workflows/build.yml`) runs the DSP tests on Linux and b
 
 - **GitHub**: [RonielOverton/DBX119-plugin](https://github.com/RonielOverton/DBX119-plugin) (private). Work on a branch per story (`d1p-<n>-short-name`); `main` holds only QA-approved work.
 - **Jira**: site `ronielo86.atlassian.net`, cloudId `b8b0c6cd-8618-43b8-b625-06cf3d77e9a0`, space "DBX 119 Plugin" (key `D1P`), label `dbx119-plugin`.
-- **Obsidian**: the vault is the GitHub repository [RonielOverton/obsidian-vault](https://github.com/RonielOverton/obsidian-vault), folder `DBX 119 Plugin/`. Notes: `Overview.md`, `Operator Agent.md`, `Jira Board.md`, `Decision Log.md`, `DSP Research.md`. Commit and push note changes to that repository.
+- **Obsidian**: the owner's local vault on his PC, `C:\Users\Roniel\Documents\Coding_RTO\Roniel's vault\DBX 119 Plugin\`. Notes: `Overview.md`, `Operator Agent.md`, `Jira Board.md`, `Decision Log.md`, `DSP Research.md`. Write them directly to that folder (from a cloud session, use the device file tools with access to the vault folder). Do not use GitHub for the notes; the owner pushes the vault himself with `push-vault-to-github.bat` when he chooses.
 - **QA results**: `docs/qa/<STORY-KEY>.md` in this repository, one file per story.
 
 ## How each piece of work runs
