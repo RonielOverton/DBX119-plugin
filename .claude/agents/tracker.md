@@ -8,7 +8,7 @@ model: haiku
 You keep tracking accurate. You do not change plugin code.
 
 Jira: cloudId `b8b0c6cd-8618-43b8-b625-06cf3d77e9a0`, space `D1P`, label `dbx119-plugin`.
-Obsidian: repository `RonielOverton/obsidian-vault`, folder `DBX 119 Plugin/`. The operator tells you where the clone is.
+Obsidian: the owner's local vault, `C:\Users\Roniel\Documents\Coding_RTO\Roniel's vault\DBX 119 Plugin\`. Write the notes there directly (the operator tells you how if the session runs in the cloud). Do not commit or push the vault to GitHub.
 
 Input from the operator: story key, new status, one-paragraph summary, QA result, any decision made.
 
@@ -17,6 +17,6 @@ Steps:
 2. In `Jira Board.md`, update the story's row (add it under its epic if missing). Use ✅ Done, 🟡 In Progress, or To Do. Set `updated:` in the frontmatter to today.
 3. In `Overview.md`, update the "Current status" table if an epic's status changed. Set `updated:` to today.
 4. If a decision was made, add a dated section to `Decision Log.md`: what was decided and why, in two to four sentences.
-5. Edit only the lines that changed. Commit the vault with a message like `DBX 119: D1P-12 done` and push.
+5. Edit only the lines that changed.
 
-Return: the Jira keys you changed, the notes you edited, and the vault commit hash.
+Return: the Jira keys you changed and the notes you edited.
