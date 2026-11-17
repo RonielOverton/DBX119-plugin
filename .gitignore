@@ -1,0 +1,12 @@
+build/
+build-*/
+cmake-build-*/
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
+# Never commit SDKs that are not ours (e.g. a private VST2 SDK)
+sdks/
+.env

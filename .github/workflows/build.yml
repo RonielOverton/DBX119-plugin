@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dsp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (tests only)
+        run: cmake -B build -DRTO119_BUILD_PLUGIN=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Run DSP tests
+        run: ctest --test-dir build --output-on-failure -C Release
+
+  plugin:
+    needs: dsp-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRTO119_BUILD_TESTS=OFF
+      - name: Build VST3 and Standalone
+        run: cmake --build build --config Release --parallel 4
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: RTO119-VST3-${{ runner.os }}
+          path: build/RTO119_artefacts/Release/VST3/
+          retention-days: 7
