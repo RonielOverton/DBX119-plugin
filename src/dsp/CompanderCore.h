@@ -14,7 +14,10 @@
 //   - Stereo link: one detector measures the sum of the two signals, L + R,
 //     as the hardware does (R5 and R15 sum into one RMS detector). The detector
 //     input is preceded by a first-order high-pass at about 31 Hz (C11, R4,
-//     R5||R15), which only affects the detector, not the audio.
+//     R5||R15). This filter only affects the detector.
+//   - Audio input is coupled by a first-order high-pass at about 7.23 Hz
+//     (C7/C17 with R6/R16, into the VCA virtual ground). The detector taps the
+//     raw input, before this filter.
 //
 // Modelling choices that still need checking against a real unit are marked
 // ASSUMPTION and tracked in Jira (calibration epic).
@@ -77,6 +80,10 @@ public:
         // Detector high-pass. Manual [M] p.12-13: C11 (0.1 uF) with R5||R15 (50 kOhm)
         // and R4 (1 kOhm) gives about 31.2 Hz = 1 / (2 pi 51e3 0.1e-6). 0 disables it.
         float detectorHighPassHz = 31.2f;
+        // Audio input high-pass. Manual [M] p.12: C7/C17 (0.22 uF) with R6/R16 (100 kOhm)
+        // feed the VCA virtual-ground input, so the audio sees 1 / (2 pi 100e3 0.22e-6),
+        // about 7.23 Hz. Audio only: the detector taps the raw input. 0 disables it.
+        float inputHighPassHz = 7.23f;
     };
 
     void prepare (double sampleRate) noexcept { prepare (sampleRate, Tuning {}); }
@@ -88,10 +95,8 @@ public:
         attackCoeff = coeffFor (tuning.attackMs);
         smoothCoeff = coeffFor (tuning.smoothingMs);
         releaseStepDb = tuning.releaseDbPerSec / static_cast<float> (fs);
-        // One-pole high-pass, y[n] = a (y[n-1] + x[n] - x[n-1]), a = 1 / (1 + 2 pi fc / fs).
-        // fc = 0 gives a = 1, which passes the signal unchanged.
-        const double hpHz = std::max (0.0, static_cast<double> (tuning.detectorHighPassHz));
-        hpAlpha = static_cast<float> (1.0 / (1.0 + 2.0 * 3.14159265358979323846 * hpHz / fs));
+        hpAlpha = onePoleAlpha (tuning.detectorHighPassHz);
+        inHpAlpha = onePoleAlpha (tuning.inputHighPassHz);
         reset();
     }
 
@@ -103,6 +108,8 @@ public:
             levelDb[c] = tuning.levelFloorDb;
             hpIn[c] = 0.0f;
             hpOut[c] = 0.0f;
+            inHpIn[c] = 0.0f;
+            inHpOut[c] = 0.0f;
         }
         smoothedAmount = target.amount;
         smoothedThreshold = target.thresholdDb;
@@ -145,8 +152,8 @@ public:
                 const float g = computeGainDb (lvl, smoothedThreshold, slope, target.mode,
                                                tuning.maxBoostDb, tuning.maxCutDb);
                 const float gain = dbToGain (g) * outGain;
-                channels[0][i] = l * gain;
-                channels[1][i] = r * gain;
+                channels[0][i] = inputHighPass (0, l) * gain;
+                channels[1][i] = inputHighPass (1, r) * gain;
                 track (lvl, g, blockMinGain, blockMaxLevel, blockAbove);
             }
             else
@@ -154,12 +161,13 @@ public:
                 for (int c = 0; c < numChannels; ++c)
                 {
                     // Unlinked (or mono): one detector per channel, fed by that channel alone.
+                    // The detector taps the raw input; the audio gets the input high-pass.
                     const float x = channels[c][i];
                     const float y = highPass (c, x);
                     const float lvl = detect (c, y * y);
                     const float g = computeGainDb (lvl, smoothedThreshold, slope, target.mode,
                                                    tuning.maxBoostDb, tuning.maxCutDb);
-                    channels[c][i] = x * dbToGain (g) * outGain;
+                    channels[c][i] = inputHighPass (c, x) * dbToGain (g) * outGain;
                     track (lvl, g, blockMinGain, blockMaxLevel, blockAbove);
                 }
             }
@@ -192,13 +200,33 @@ private:
         return 1.0f - std::exp (-1.0f / (0.001f * ms * static_cast<float> (fs)));
     }
 
+    // Coefficient a = 1 / (1 + 2 pi fc / fs) of the one-pole high-pass
+    // y[n] = a (y[n-1] + x[n] - x[n-1]). fc = 0 gives a = 1, which passes the signal unchanged.
+    float onePoleAlpha (float hz) const noexcept
+    {
+        const double fc = std::max (0.0, static_cast<double> (hz));
+        return static_cast<float> (1.0 / (1.0 + 2.0 * 3.14159265358979323846 * fc / fs));
+    }
+
+    // One-pole high-pass step. xs holds the previous input, ys the previous output.
+    static float onePoleHighPass (float alpha, float& xs, float& ys, float x) noexcept
+    {
+        const float y = alpha * (ys + x - xs);
+        xs = x;
+        ys = y;
+        return y;
+    }
+
     // Detector-path high-pass, state per detector index c (0 for linked, 0 or 1 unlinked).
     float highPass (int c, float x) noexcept
     {
-        const float y = hpAlpha * (hpOut[c] + x - hpIn[c]);
-        hpIn[c] = x;
-        hpOut[c] = y;
-        return y;
+        return onePoleHighPass (hpAlpha, hpIn[c], hpOut[c], x);
+    }
+
+    // Audio input high-pass (C7/C17), state per channel c (0 and 1).
+    float inputHighPass (int c, float x) noexcept
+    {
+        return onePoleHighPass (inHpAlpha, inHpIn[c], inHpOut[c], x);
     }
 
     // RMS detector: one-pole mean-square integrator for the attack, then the
@@ -228,6 +256,9 @@ private:
     float hpAlpha = 1.0f;
     float hpIn[2] {};
     float hpOut[2] {};
+    float inHpAlpha = 1.0f;
+    float inHpIn[2] {};
+    float inHpOut[2] {};
     float smoothedAmount = 0.0f, smoothedThreshold = -20.0f, smoothedOutput = 0.0f;
     float lastGainDb = 0.0f, lastLevelDb = -80.0f;
     bool aboveThreshold = false;

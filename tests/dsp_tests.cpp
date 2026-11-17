@@ -153,8 +153,13 @@ void testComputeGainClamping()
 
 void testUnity()
 {
+    // Input high-pass off: at 1 kHz it adds a phase lead of about 0.4 degrees, which
+    // changes the output sample by sample (about 3.6e-3 at 0.5 amplitude), so this
+    // exact-match test would fail. Its response is tested in testAudioHighPassResponse.
+    rto119::CompanderCore::Tuning t;
+    t.inputHighPassHz = 0.0f;
     rto119::CompanderCore core;
-    core.prepare (kFs);
+    core.prepare (kFs, t);
     rto119::Parameters p;
     p.amount = 0.0f;
     p.outputDb = 0.0f;
@@ -473,6 +478,132 @@ void testOutputGain()
     CHECK_NEAR (outDelta, 6.0, 0.05);
 }
 
+// Length in samples of the last `seconds` of a tone at freqHz, cut to whole cycles.
+std::size_t wholeCycleSamples (double freqHz, double seconds)
+{
+    const double cycles = std::floor (seconds * freqHz);
+    return static_cast<std::size_t> (std::llround (cycles * kFs / freqHz));
+}
+
+double meanOf (const std::vector<float>& v, std::size_t start, std::size_t end)
+{
+    double acc = 0.0;
+    for (std::size_t i = start; i < end; ++i)
+        acc += static_cast<double> (v[i]);
+    return acc / static_cast<double> (end - start);
+}
+
+enum class Routing { Linked, Unlinked, Mono };
+
+// Steady-state gain of the audio path at unity (amount 0, default tuning), in dB:
+// output RMS over input RMS, measured over the last 2 s of a 4 s sine.
+double audioPathGainDb (double freqHz, Routing routing)
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs);
+    rto119::Parameters p;
+    p.amount = 0.0f;
+    p.outputDb = 0.0f;
+    p.stereoLink = routing == Routing::Linked;
+    core.setParameters (p);
+
+    const std::size_t n = 4 * kSecond;
+    const std::vector<float> in = makeSine (n, 0.5f, freqHz);
+    std::vector<float> left = in;
+    std::vector<float> right = in;
+    const int numChannels = routing == Routing::Mono ? 1 : 2;
+    for (std::size_t start = 0; start < n; start += 256)
+    {
+        const int len = static_cast<int> (std::min<std::size_t> (256, n - start));
+        float* chans[2] = { left.data () + start, right.data () + start };
+        core.process (chans, numChannels, len);
+    }
+
+    const std::size_t from = n - wholeCycleSamples (freqHz, 2.0);
+    return rmsDb (left, from, n) - rmsDb (in, from, n);
+}
+
+// Input high-pass at 7.23 Hz (C7/C17 with R6/R16): -3.01 dB at 7.23 Hz, less than
+// 0.1 dB loss at 50 Hz, flat at 1 kHz. Checked for linked, unlinked and mono routing.
+void testAudioHighPassResponse()
+{
+    const Routing routings[] = { Routing::Linked, Routing::Unlinked, Routing::Mono };
+    const char* names[] = { "linked", "unlinked", "mono" };
+    for (int k = 0; k < 3; ++k)
+    {
+        const double g7 = audioPathGainDb (7.23, routings[k]);
+        const double g50 = audioPathGainDb (50.0, routings[k]);
+        const double g1k = audioPathGainDb (1000.0, routings[k]);
+        std::printf ("info: input high-pass %s: 7.23 Hz %.4f dB, 50 Hz %.4f dB, 1 kHz %.4f dB\n",
+                     names[k], g7, g50, g1k);
+        CHECK_NEAR (g7, -3.01, 0.3);
+        CHECK (g50 >= -0.1 && g50 <= 0.001);
+        CHECK_NEAR (g1k, 0.0, 0.01);
+    }
+}
+
+// A constant input has no output in steady state: the input high-pass removes DC.
+void testAudioHighPassRemovesDc()
+{
+    const bool links[] = { true, false };
+    for (bool link : links)
+    {
+        rto119::CompanderCore core;
+        core.prepare (kFs);
+        rto119::Parameters p;
+        p.amount = 0.0f;
+        p.outputDb = 0.0f;
+        p.stereoLink = link;
+        core.setParameters (p);
+
+        const std::size_t n = 2 * kSecond;
+        std::vector<float> left (n, 0.5f);
+        std::vector<float> right (n, 0.5f);
+        runStereo (core, left, right);
+
+        const std::size_t from = n - kSecond / 5;   // last 0.2 s
+        CHECK (std::fabs (meanOf (left, from, n)) < 0.001);
+        CHECK (std::fabs (meanOf (right, from, n)) < 0.001);
+    }
+}
+
+// Detected level of a linked stereo sine after 2 s.
+double linkedLevelAfterSine (double freqHz, double sineRmsDb, const rto119::CompanderCore::Tuning& t)
+{
+    rto119::CompanderCore core;
+    core.prepare (kFs, t);
+    rto119::Parameters p;
+    p.amount = -0.5f;
+    p.thresholdDb = -40.0f;
+    p.mode = rto119::Mode::Linear;
+    p.stereoLink = true;
+    core.setParameters (p);
+
+    std::vector<float> left = makeSine (2 * kSecond, ampFromRmsDb (sineRmsDb), freqHz);
+    std::vector<float> right = left;
+    runStereo (core, left, right);
+    return core.getLevelDb ();
+}
+
+// The detector taps the raw input, before the input high-pass, so the detected level
+// does not depend on inputHighPassHz.
+void testDetectorIgnoresInputHighPass()
+{
+    rto119::CompanderCore::Tuning withIn;      // default 7.23 Hz input high-pass
+    rto119::CompanderCore::Tuning noIn;
+    noIn.inputHighPassHz = 0.0f;
+
+    // 1 kHz at -10 dBFS RMS (the case in the story). The input high-pass changes this
+    // signal by only about 0.0002 dB, so it cannot tell the wiring apart.
+    CHECK_NEAR (linkedLevelAfterSine (1000.0, -10.0, withIn),
+                linkedLevelAfterSine (1000.0, -10.0, noIn), 0.01);
+
+    // 20 Hz at -10 dBFS RMS (added): the input high-pass alone changes this tone by
+    // 0.54 dB, so a detector fed from the filtered signal would fail here.
+    CHECK_NEAR (linkedLevelAfterSine (20.0, -10.0, withIn),
+                linkedLevelAfterSine (20.0, -10.0, noIn), 0.01);
+}
+
 } // namespace
 
 int main()
@@ -492,6 +623,9 @@ int main()
     testDetectorHighPass ();
     testThresholdLedMode ();
     testOutputGain ();
+    testAudioHighPassResponse ();
+    testAudioHighPassRemovesDc ();
+    testDetectorIgnoresInputHighPass ();
 
     if (g_failures == 0)
     {
