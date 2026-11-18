@@ -73,3 +73,21 @@ target_link_libraries(RTO119
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# ---------------------------------------------------------------------------
+# Processor tests (D1P-22): a console test that drives RTO119Processor directly.
+# No editor, no GUI. Links the RTO119 target, which is the static shared-code library
+# built by juce_add_plugin (output name RTO119_SharedCode).
+# ---------------------------------------------------------------------------
+if(RTO119_BUILD_TESTS)
+    add_executable(rto119_processor_tests tests/processor_tests.cpp)
+    target_include_directories(rto119_processor_tests PRIVATE
+        src
+        $<TARGET_PROPERTY:RTO119,JUCE_GENERATED_SOURCES_DIRECTORY>)   # JuceHeader.h
+    target_link_libraries(rto119_processor_tests PRIVATE
+        RTO119
+        juce::juce_audio_plugin_client   # JuceHeader.h includes it; headers only
+        juce::juce_audio_utils
+        juce::juce_dsp)
+    add_test(NAME processor_tests COMMAND rto119_processor_tests)
+endif()

@@ -5,6 +5,7 @@
 #include "dsp/IronStage.h"
 
 #include <atomic>
+#include <vector>
 
 namespace ParamIDs
 {
@@ -28,6 +29,10 @@ public:
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     using AudioProcessor::processBlock;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    // Host-side bypass (used by hosts that do not use getBypassParameter): same D-sample
+    // delay as the active path, as JUCE requires for a plugin that reports latency.
+    using AudioProcessor::processBlockBypassed;
+    void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
@@ -59,19 +64,34 @@ public:
     std::atomic<bool>  meterAboveThreshold { false };
 
 private:
-    void processIron (juce::AudioBuffer<float>& buffer);
-    void processIronChunk (juce::AudioBuffer<float>& buffer, int start, int len);
+    // Output stage (D1P-22): Iron crossfade plus latency alignment. Runs on every block.
+    void processOutput (juce::AudioBuffer<float>& buffer, bool bypassed);
+    void processOutputChunk (juce::AudioBuffer<float>& buffer, int start, int len,
+                             bool wetNeeded, bool bypassed);
+    void processIronWet (juce::AudioBuffer<float>& buffer, int start, int len, int numCh);
 
     rto119::CompanderCore core;
 
     // Iron stage (D1P-21). NOT PART OF THE ORIGINAL 119; see src/dsp/IronStage.h.
-    // 2 channels, factor 2 = 4x. The IIR latency is not reported (see PluginProcessor.cpp).
+    // 2 channels, factor 2 = 4x.
     juce::dsp::Oversampling<float> oversampler { 2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, false };
     rto119::IronStage iron;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ironMix;
     juce::AudioBuffer<float> dryBuffer;   // preallocated in prepareToPlay, 2 x samplesPerBlock
     int ironMaxBlock = 0;                 // largest block the stage is prepared for
     std::atomic<float>* ironParam = nullptr;
+
+    // Latency alignment (D1P-22). L = oversampler latency (fractional), D = reported
+    // latency (whole samples, D = ceil(L)), frac = D - L. Wet path: oversampler (L)
+    // then a Thiran fractional delay (frac), so wet total = D. Dry path: an integer
+    // delay of D samples, stored in a ring buffer of 2 * D floats.
+    int ironLatencySamples = 0;           // D
+    float ironFracSamples = 0.0f;         // frac, 0 <= frac < 1
+    bool ironFracActive = false;          // frac >= 1e-4
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Thiran> ironFrac;
+    std::vector<float> dryRing;           // 2 channels x D samples, preallocated in prepareToPlay
+    int dryPos[2] { 0, 0 };
+    bool wetRunning = false;              // true while the Iron path has been run on the previous block
 
     std::atomic<float>* amountParam = nullptr;
     std::atomic<float>* thresholdParam = nullptr;

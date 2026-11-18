@@ -28,9 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRTO119_BUILD_TESTS=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRTO119_BUILD_TESTS=ON
       - name: Build VST3 and Standalone
         run: cmake --build build --config Release --parallel 4
+      - name: Run processor tests
+        run: ctest --test-dir build --output-on-failure -C Release
       - name: Upload VST3
         uses: actions/upload-artifact@v4
         with:
