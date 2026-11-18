@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <cmath>
+
 namespace
 {
     // Display text for the single compression/expansion control.
@@ -75,17 +77,45 @@ void RTO119Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     core.prepare (sampleRate);
 
-    // Iron stage (D1P-21). All buffers are allocated here, never in processBlock.
-    // The oversampler is built with factor 2, so it runs at 4x the host rate.
-    // The oversampler's IIR latency is NOT reported to the host (getLatencyInSamples()
-    // stays 0, as D1P-21 requires). Measured with this configuration: 3.42 samples at the
-    // host rate. The Iron path is a parallel crossfade, not a latency-compensated insert.
+    // All buffers are allocated here, never in processBlock.
     const int maxBlock = juce::jmax (1, samplesPerBlock);
     ironMaxBlock = maxBlock;
+
+    // The oversampler is built with factor 2, so it runs at 4x the host rate.
+    // initProcessing() sizes its buffers and calls reset().
     oversampler.initProcessing (static_cast<size_t> (maxBlock));
-    oversampler.reset();
-    iron.prepare (sampleRate * 4.0);
+
+    // Latency (D1P-22). L is the oversampler's IIR delay in host samples (fractional).
+    // g is the delay the Iron stage's own 40 kHz softening pole adds to the wet path
+    // (DC group delay of a one-pole at 4x, in host samples). It is in the wet path, so
+    // it counts toward the wet total. The host gets D, always, whether Iron is on or off,
+    // so the reported latency never changes at runtime. The wet path gets a Thiran
+    // fractional delay frac = D - (L + g) in [0, 1). The dry path gets D integer samples.
+    // Both paths end up at D.
+    // D = ceil(L + g), as in D1P-22. Here D = 4 (L = 3.42, g = 0.09); the g term keeps
+    // frac in [0, 1) if the values move.
+    constexpr double kPi = 3.14159265358979323846;
+    const double fourX = sampleRate * 4.0;
+    const double poleCoeff = 1.0 - std::exp (-2.0 * kPi * rto119::IronStage::kHighCornerHz / fourX);
+    const double poleDelayHost = (1.0 - poleCoeff) / poleCoeff / 4.0;
+
+    const double latency = static_cast<double> (oversampler.getLatencyInSamples()) + poleDelayHost;
+    ironLatencySamples = static_cast<int> (std::ceil (latency - 1e-6));
+    ironFracSamples = static_cast<float> (juce::jmax (0.0, static_cast<double> (ironLatencySamples) - latency));
+    ironFracActive = ironFracSamples >= 1e-4f;
+    setLatencySamples (ironLatencySamples);
+
+    iron.prepare (fourX);
+
     dryBuffer.setSize (2, maxBlock, false, false, true);
+    dryRing.assign (static_cast<size_t> (2 * ironLatencySamples), 0.0f);
+    dryPos[0] = 0;
+    dryPos[1] = 0;
+
+    ironFrac.setMaximumDelayInSamples (2);
+    ironFrac.prepare (juce::dsp::ProcessSpec { sampleRate, static_cast<juce::uint32> (maxBlock), 2 });
+    ironFrac.setDelay (ironFracSamples);
+    wetRunning = false;
 
     // 20 ms linear crossfade between the dry and Iron paths. Starts at the saved state.
     ironMix.reset (sampleRate, 0.02);
@@ -107,61 +137,151 @@ void RTO119Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     for (auto ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, buffer.getNumSamples());
 
-    if (bypassParam->load() > 0.5f)
+    // Bypass (D1P-22): the core is skipped, but the output still goes through the same
+    // latency alignment, so the bypassed output is delayed by D just like the active one.
+    const bool bypassed = bypassParam->load() > 0.5f;
+
+    if (bypassed)
     {
         meterGainDb = 0.0f;
         meterAboveThreshold = false;
-        return;
+    }
+    else
+    {
+        rto119::Parameters p;
+        p.amount      = amountParam->load();
+        p.thresholdDb = thresholdParam->load();
+        p.mode        = modeParam->load() > 0.5f ? rto119::Mode::AboveThreshold : rto119::Mode::Linear;
+        p.outputDb    = outputParam->load();
+        p.stereoLink  = linkParam->load() > 0.5f;
+        core.setParameters (p);
+
+        core.process (buffer.getArrayOfWritePointers(),
+                      juce::jmin (2, getTotalNumOutputChannels()),
+                      buffer.getNumSamples());
     }
 
-    rto119::Parameters p;
-    p.amount      = amountParam->load();
-    p.thresholdDb = thresholdParam->load();
-    p.mode        = modeParam->load() > 0.5f ? rto119::Mode::AboveThreshold : rto119::Mode::Linear;
-    p.outputDb    = outputParam->load();
-    p.stereoLink  = linkParam->load() > 0.5f;
-    core.setParameters (p);
+    processOutput (buffer, bypassed);
 
-    core.process (buffer.getArrayOfWritePointers(),
-                  juce::jmin (2, getTotalNumOutputChannels()),
-                  buffer.getNumSamples());
-
-    processIron (buffer);
-
-    meterGainDb = core.getGainDb();
-    meterLevelDb = core.getLevelDb();
-    meterAboveThreshold = core.isAboveThreshold();
+    if (! bypassed)
+    {
+        meterGainDb = core.getGainDb();
+        meterLevelDb = core.getLevelDb();
+        meterAboveThreshold = core.isAboveThreshold();
+    }
 }
 
-// Iron stage (D1P-21). NOT PART OF THE ORIGINAL 119. Real-time safe: no allocation,
-// no locks, no I/O. Runs only while the mix is moving or on; when off and fully faded
-// out, the buffer is left bit-identical.
-void RTO119Processor::processIron (juce::AudioBuffer<float>& buffer)
+// Output stage (D1P-21 Iron, D1P-22 latency). NOT PART OF THE ORIGINAL 119 for Iron.
+// Real-time safe: no allocation, no locks, no I/O.
+//
+// Per block:
+//   - The Iron (wet) path runs only while the mix is moving or above 0. When it is off
+//     and fully faded out, the oversampler is skipped (cheap).
+//   - The dry path always runs: the signal is delayed by exactly D samples. So the output
+//     is always D samples late, with Iron on, off, or bypassed.
+//   - Crossfade: out = dryDelayed + (wetAligned - dryDelayed) * mix.
+void RTO119Processor::processBlockBypassed (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    for (auto ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
+        buffer.clear (ch, 0, buffer.getNumSamples());
+
+    meterGainDb = 0.0f;
+    meterAboveThreshold = false;
+    processOutput (buffer, true);
+}
+
+void RTO119Processor::processOutput (juce::AudioBuffer<float>& buffer, bool bypassed)
 {
     ironMix.setTargetValue (ironParam->load() > 0.5f ? 1.0f : 0.0f);
 
-    if (! ironMix.isSmoothing() && ironMix.getCurrentValue() <= 0.0f)
-        return;
+    const bool wetNeeded = ironMix.isSmoothing() || ironMix.getCurrentValue() > 0.0f;
+
+    // Iron is starting from zero (mix moving up from 0 after being idle). Clear the
+    // oversampler, the fractional delay and the IIR filter, so no stale state is used.
+    // JUCE's Oversampling::reset() and DelayLine::reset() only clear existing storage;
+    // neither allocates.
+    if (wetNeeded && ! wetRunning)
+    {
+        oversampler.reset();
+        ironFrac.reset();
+        iron.reset();
+    }
+    wetRunning = wetNeeded;
 
     if (ironMaxBlock <= 0)
         return;
 
     // A host may send a block larger than prepared. Process it in chunks of the
-    // prepared size: the oversampler is stateful, so chunks join without a gap.
+    // prepared size. Every stateful part (oversampler, fractional delay, dry ring)
+    // carries its state across chunks, so the chunks join without a gap.
     const int total = buffer.getNumSamples();
     for (int start = 0; start < total; start += ironMaxBlock)
-        processIronChunk (buffer, start, juce::jmin (ironMaxBlock, total - start));
+        processOutputChunk (buffer, start, juce::jmin (ironMaxBlock, total - start), wetNeeded, bypassed);
 }
 
-void RTO119Processor::processIronChunk (juce::AudioBuffer<float>& buffer, int start, int len)
+void RTO119Processor::processOutputChunk (juce::AudioBuffer<float>& buffer, int start, int len,
+                                          bool wetNeeded, bool bypassed)
 {
     const int numCh = juce::jmin (2, buffer.getNumChannels());
 
-    // Dry copy for the crossfade.
+    // Unprocessed signal for the dry path (and the input to the Iron path).
     for (int ch = 0; ch < numCh; ++ch)
         dryBuffer.copyFrom (ch, 0, buffer, ch, start, len);
 
-    // Up: 4x. Input pointers live on the stack.
+    // Wet path: buffer chunk becomes the Iron signal, aligned to D samples.
+    if (wetNeeded)
+        processIronWet (buffer, start, len, numCh);
+
+    // Dry path: delay by exactly D samples, in place in dryBuffer. Per channel,
+    // a ring of D samples. Output sample i is input sample i - D.
+    const int D = ironLatencySamples;
+    if (D > 0)
+    {
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            float* d = dryBuffer.getWritePointer (ch);
+            float* ring = dryRing.data() + static_cast<size_t> (ch) * static_cast<size_t> (D);
+            int pos = dryPos[ch];
+            for (int i = 0; i < len; ++i)
+            {
+                const float in = d[i];
+                d[i] = ring[pos];
+                ring[pos] = in;
+                if (++pos == D)
+                    pos = 0;
+            }
+            dryPos[ch] = pos;
+        }
+    }
+
+    // Output: crossfade from dry (delayed) to wet (aligned). Bypass outputs the dry path only.
+    if (wetNeeded)
+    {
+        for (int i = 0; i < len; ++i)
+        {
+            const float mix = ironMix.getNextValue();
+            for (int ch = 0; ch < numCh; ++ch)
+            {
+                const float dry = dryBuffer.getSample (ch, i);
+                const float wet = buffer.getSample (ch, start + i);
+                buffer.setSample (ch, start + i, bypassed ? dry : dry + (wet - dry) * mix);
+            }
+        }
+    }
+    else
+    {
+        // Mix is 0 and not moving: the output is the dry path alone, bit for bit.
+        for (int ch = 0; ch < numCh; ++ch)
+            buffer.copyFrom (ch, start, dryBuffer, ch, 0, len);
+    }
+}
+
+// Iron wet path for one chunk: oversample up, Iron stage at 4x, oversample down (latency L),
+// then the Thiran fractional delay (frac). Output is aligned to D samples.
+void RTO119Processor::processIronWet (juce::AudioBuffer<float>& buffer, int start, int len, int numCh)
+{
     const float* inPtrs[2] = { nullptr, nullptr };
     float* outPtrs[2] = { nullptr, nullptr };
     for (int ch = 0; ch < numCh; ++ch)
@@ -170,6 +290,7 @@ void RTO119Processor::processIronChunk (juce::AudioBuffer<float>& buffer, int st
         outPtrs[ch] = buffer.getWritePointer (ch, start);
     }
 
+    // Up: 4x. Input pointers live on the stack.
     juce::dsp::AudioBlock<const float> inBlock (inPtrs, static_cast<size_t> (numCh), static_cast<size_t> (len));
     juce::dsp::AudioBlock<float> up = oversampler.processSamplesUp (inBlock);
 
@@ -180,24 +301,19 @@ void RTO119Processor::processIronChunk (juce::AudioBuffer<float>& buffer, int st
             x[i] = iron.processSample (ch, x[i]);
     }
 
-    // Down: back to the host rate, into the main buffer.
+    // Down: back to the host rate, into the main buffer chunk.
     juce::dsp::AudioBlock<float> outBlock (outPtrs, static_cast<size_t> (numCh), static_cast<size_t> (len));
     oversampler.processSamplesDown (outBlock);
 
-    // Crossfade per sample: out = dry + (wet - dry) * mix.
-    float* wet[2] = { nullptr, nullptr };
-    const float* dry[2] = { nullptr, nullptr };
-    for (int ch = 0; ch < numCh; ++ch)
+    // Fractional delay so the wet total is L + frac = D.
+    if (ironFracActive)
     {
-        wet[ch] = outPtrs[ch];
-        dry[ch] = dryBuffer.getReadPointer (ch, 0);
-    }
-
-    for (int i = 0; i < len; ++i)
-    {
-        const float mix = ironMix.getNextValue();
         for (int ch = 0; ch < numCh; ++ch)
-            wet[ch][i] = dry[ch][i] + (wet[ch][i] - dry[ch][i]) * mix;
+            for (int i = 0; i < len; ++i)
+            {
+                ironFrac.pushSample (ch, outPtrs[ch][i]);
+                outPtrs[ch][i] = ironFrac.popSample (ch);
+            }
     }
 }
 
